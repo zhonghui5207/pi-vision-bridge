@@ -1,0 +1,32 @@
+{
+  "name": "pi-vision-bridge",
+  "version": "1.0.0",
+  "description": "Give non-vision Pi models image understanding: auto-delegates attached images to a vision-capable model sub-agent, with a macOS local OCR fallback.",
+  "type": "module",
+  "license": "MIT",
+  "author": "zhonghui5207",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhonghui5207/pi-vision-bridge.git"
+  },
+  "homepage": "https://github.com/zhonghui5207/pi-vision-bridge#readme",
+  "bugs": "https://github.com/zhonghui5207/pi-vision-bridge/issues",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "vision",
+    "image",
+    "ocr",
+    "multimodal"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ]
+}
