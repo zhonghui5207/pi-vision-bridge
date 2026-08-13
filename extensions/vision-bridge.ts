@@ -24,7 +24,10 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 // 图片内容（与 pi RPC 协议的 ImageContent 形状一致）
 interface ImageContent {
@@ -36,7 +39,13 @@ interface ImageContent {
 // ---- 配置 ---------------------------------------------------------------
 
 const MODEL_TIMEOUT_MS = 90_000;
-const AGENT_FILE = path.join(os.homedir(), ".pi", "agent", "agents", "vision.md");
+const AGENT_FILE = path.join(
+	os.homedir(),
+	".pi",
+	"agent",
+	"agents",
+	"vision.md",
+);
 
 const VISION_TASK_TEMPLATE = (userPrompt: string) =>
 	[
@@ -135,7 +144,10 @@ function recognizeWithModel(
 		let tmpPromptPath: string | null = null;
 		if (systemPrompt) {
 			try {
-				tmpPromptPath = path.join(os.tmpdir(), `vision-agent-${process.pid}-${Date.now()}.md`);
+				tmpPromptPath = path.join(
+					os.tmpdir(),
+					`vision-agent-${process.pid}-${Date.now()}.md`,
+				);
 				fs.writeFileSync(tmpPromptPath, systemPrompt, { encoding: "utf-8" });
 				args.push("--append-system-prompt", tmpPromptPath);
 			} catch {
@@ -163,7 +175,13 @@ function recognizeWithModel(
 			}
 		}
 
-		proc.stdin!.write(JSON.stringify({ type: "prompt", message: VISION_TASK_TEMPLATE(userPrompt), images }) + "\n");
+		proc.stdin!.write(
+			JSON.stringify({
+				type: "prompt",
+				message: VISION_TASK_TEMPLATE(userPrompt),
+				images,
+			}) + "\n",
+		);
 
 		let buffer = "";
 		const collected: string[] = [];
@@ -262,7 +280,10 @@ export default function (pi: ExtensionAPI) {
 	// 命令指定 > 环境变量 > agent 文件（无默认）
 	let cliModel: string | undefined;
 
-	function resolveVisionModel(): { model: string; systemPrompt?: string } | null {
+	function resolveVisionModel(): {
+		model: string;
+		systemPrompt?: string;
+	} | null {
 		if (cliModel) return { model: cliModel };
 		const envModel = process.env.PI_VISION_MODEL?.trim();
 		if (envModel) return { model: envModel };
@@ -300,7 +321,10 @@ export default function (pi: ExtensionAPI) {
 				`🖼 当前模型 ${currentModel} 不支持图片，调用视觉子代理 (${config.model}) 识别...`,
 				"info",
 			);
-			ctx.ui.setStatus("vision-bridge", `👁 视觉子代理 ${config.model} 识别中...`);
+			ctx.ui.setStatus(
+				"vision-bridge",
+				`👁 视觉子代理 ${config.model} 识别中...`,
+			);
 		}
 
 		const description = await recognizeWithModel(
