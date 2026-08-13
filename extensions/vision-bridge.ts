@@ -14,10 +14,12 @@
  * 如果三者都未配置：不调用任何东西，并提示先指定视觉模型。
  * 不同设备安装后，各自配置本机可用的视觉模型即可。
  *
- * 子代理调用：spawn `pi --mode rpc --no-extensions --model <视觉模型>`
- * 子进程，通过 RPC 协议把图片（base64）直接发给视觉模型。
- * 注意：RPC 子进程必须保持 stdin 打开直到拿到最终 message_end，
- * 否则 pi 会把 stdin 关闭当作 shutdown 信号提前退出。
+ * 子代理调用：spawn `pi -p --no-extensions --model <视觉模型>` 子进程。
+ * 图片先保存为临时文件，任务里让子代理用 read 工具自己读图
+ * （pi 对支持图片的模型，read 工具会把图片数据直接交给模型）。
+ *
+ * 注意：用纯 -p（print）模式而非 rpc/json 事件流模式——部分 provider
+ * （如 openai-codex）在 rpc/json 模式下工具调用链路会挂起，纯 -p 正常。
  */
 
 import { spawn } from "node:child_process";
@@ -26,15 +28,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	ExtensionAPI,
-	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-
-// 图片内容（与 pi RPC 协议的 ImageContent 形状一致）
-interface ImageContent {
-	type: "image";
-	data: string; // base64 编码的图片数据
-	mimeType: string; // 如 "image/png"
-}
 
 // ---- 配置 ---------------------------------------------------------------
 
@@ -47,10 +41,13 @@ const AGENT_FILE = path.join(
 	"vision.md",
 );
 
-const VISION_TASK_TEMPLATE = (userPrompt: string) =>
+const VISION_TASK_TEMPLATE = (imagePaths: string[], userPrompt: string) =>
 	[
 		"你是一个图像识别代理。用户刚刚给主对话附加了图片，但主模型不支持图片输入。",
-		"请仔细查看这张/这些图片，然后完成两件事：",
+		"图片已保存为本地文件，请先用 read 工具读取以下图片文件，再回答问题：",
+		...imagePaths.map((p) => `  - ${p}`),
+		"",
+		"读取图片后完成两件事：",
 		"1) 详细、准确地描述图片内容（布局、元素、文字、颜色等）；",
 		"2) 如果用户的问题与图片相关，直接基于图片回答用户的问题。",
 		"",
@@ -119,10 +116,10 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 /**
  * 用视觉模型子进程识别图片，返回最终文本；失败/超时返回 null。
- * 关键：保持子进程 stdin 打开，拿到最终 assistant message 后再关。
+ * 纯 -p（print）模式：图片由子代理用 read 工具自行读取。
  */
 function recognizeWithModel(
-	images: ImageContent[],
+	imagePaths: string[],
 	userPrompt: string,
 	model: string,
 	systemPrompt: string | undefined,
@@ -138,7 +135,7 @@ function recognizeWithModel(
 			}
 		};
 
-		const args = ["--mode", "rpc", "--no-extensions", "--model", model];
+		const args = ["-p", "--no-extensions", "--model", model];
 
 		// 视觉代理正文作为子代理的 system prompt
 		let tmpPromptPath: string | null = null;
@@ -155,17 +152,14 @@ function recognizeWithModel(
 			}
 		}
 
+		// -p 模式：prompt 作为最后一个命令行参数
+		args.push(VISION_TASK_TEMPLATE(imagePaths, userPrompt));
+
 		const { command, args: fullArgs } = getPiInvocation(args);
 		let proc: ReturnType<typeof spawn>;
 		try {
-			proc = spawn(command, fullArgs, { stdio: ["pipe", "pipe", "pipe"] });
+			proc = spawn(command, fullArgs, { stdio: ["ignore", "pipe", "pipe"] });
 		} catch {
-			cleanupTmp();
-			finish(null);
-			return;
-		}
-
-		function cleanupTmp() {
 			if (tmpPromptPath) {
 				try {
 					fs.unlinkSync(tmpPromptPath);
@@ -173,49 +167,27 @@ function recognizeWithModel(
 					/* ignore */
 				}
 			}
+			finish(null);
+			return;
 		}
 
-		proc.stdin!.write(
-			JSON.stringify({
-				type: "prompt",
-				message: VISION_TASK_TEMPLATE(userPrompt),
-				images,
-			}) + "\n",
-		);
-
-		let buffer = "";
-		const collected: string[] = [];
-
-		proc.stdout!.on("data", (data: Buffer) => {
-			buffer += data.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				let ev: any;
-				try {
-					ev = JSON.parse(trimmed);
-				} catch {
-					continue;
-				}
-				if (ev?.type !== "message_end") continue;
-				const msg = ev.message;
-				if (msg?.role !== "assistant") continue;
-				const text = (msg.content ?? [])
-					.filter((p: any) => p.type === "text")
-					.map((p: any) => p.text)
-					.join("");
-				if (text) collected.push(text);
-				if (["stop", "length", "error", "aborted"].includes(msg.stopReason)) {
-					teardown();
-				}
-			}
+		let stdout = "";
+		proc.stdout!.on("data", (d: Buffer) => {
+			stdout += d.toString();
 		});
-
 		proc.stderr!.on("data", () => {
 			/* 忽略 */
 		});
+
+		const cleanupTmp = () => {
+			if (tmpPromptPath) {
+				try {
+					fs.unlinkSync(tmpPromptPath);
+				} catch {
+					/* ignore */
+				}
+			}
+		};
 
 		const killProc = () => {
 			try {
@@ -234,42 +206,35 @@ function recognizeWithModel(
 
 		const timeout = setTimeout(() => {
 			killProc();
+			cleanupTmp();
 			finish(null);
 		}, timeoutMs);
 
 		const onAbort = () => {
 			killProc();
+			cleanupTmp();
 			finish(null);
 		};
 
-		function teardown() {
+		proc.on("error", () => {
 			clearTimeout(timeout);
 			if (signal) signal.removeEventListener("abort", onAbort);
-			try {
-				proc.stdin!.end();
-			} catch {
-				/* ignore */
-			}
-			proc.once("exit", () => {
-				cleanupTmp();
-				finish(collected.join("\n").trim() || null);
-			});
-			setTimeout(() => {
-				cleanupTmp();
-				finish(collected.join("\n").trim() || null);
-			}, 2000);
-		}
+			cleanupTmp();
+			finish(null);
+		});
+
+		proc.on("close", (code) => {
+			clearTimeout(timeout);
+			if (signal) signal.removeEventListener("abort", onAbort);
+			cleanupTmp();
+			const text = stdout.trim();
+			finish(code === 0 && text ? text : null);
+		});
 
 		if (signal) {
 			if (signal.aborted) onAbort();
 			else signal.addEventListener("abort", onAbort, { once: true });
 		}
-
-		proc.on("error", () => {
-			clearTimeout(timeout);
-			cleanupTmp();
-			finish(null);
-		});
 	});
 }
 
@@ -327,14 +292,35 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
+		// 图片先保存为临时文件，供子代理用 read 工具读取
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-bridge-"));
+		const imagePaths: string[] = [];
+		try {
+			for (let i = 0; i < images.length; i++) {
+				const img = images[i]!;
+				const ext = img.mimeType?.includes("png") ? ".png" : ".jpg";
+				const p = path.join(tmpDir, `image-${i}${ext}`);
+				fs.writeFileSync(p, Buffer.from(img.data, "base64"));
+				imagePaths.push(p);
+			}
+		} catch {
+			/* 写文件失败则放弃 */
+		}
+
 		const description = await recognizeWithModel(
-			images,
+			imagePaths,
 			event.prompt ?? "",
 			config.model,
 			config.systemPrompt,
 			ctx.signal,
 			MODEL_TIMEOUT_MS,
 		);
+
+		try {
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
 
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("vision-bridge", undefined);

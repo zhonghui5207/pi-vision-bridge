@@ -76,10 +76,10 @@ export PI_VISION_MODEL="openai-codex/gpt-5.4-mini"
 
 - 监听 `before_agent_start`，读取 `event.images`（base64 `ImageContent[]`）；
 - 检查 `ctx.model.input` 是否包含 `"image"` 判断当前模型是否有视觉，有则直接跳过；
-- 无视觉时 spawn `pi --mode rpc --no-extensions --model <你的视觉模型>` 子进程（与 pi-subagents 同款的"子代理"模式：独立进程 + 独立上下文 + `--model` 覆盖），通过 RPC 协议把图片（base64）发给视觉模型；
+- 无视觉时把图片保存为临时文件，spawn 一个**视觉子代理**：`pi -p --no-extensions --model <你的视觉模型>`，任务里让子代理用 read 工具自行读取图片（pi 对支持图片的模型，read 工具会把图片数据直接交给模型）；
 - 子代理正文（vision.md 的内容）通过 `--append-system-prompt` 注入子进程；
-- **关键**：RPC 子进程的 stdin 必须保持打开直到拿到最终 `message_end`，否则 pi 会把 stdin 关闭当作 shutdown 信号提前退出；
-- 把子代理输出作为 `{ message: { customType: "vision-bridge", ... } }` 注入会话（进入 LLM 上下文）。
+- 用纯 `-p`（print）模式而非 rpc/json 事件流模式——部分 provider（如 openai-codex）在 rpc/json 模式下工具调用链路会挂起，纯 `-p` 正常；
+- 把子代理输出（stdout 即最终文本）作为 `{ message: { customType: "vision-bridge", ... } }` 注入会话（进入 LLM 上下文）。
 
 ## 多设备说明
 
