@@ -26,9 +26,14 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type {
-	ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+// before_agent_start 事件里 event.images 的元素形状（pi 的 ImageContent）
+interface ImageContentLike {
+	type: string;
+	data: string; // base64
+	mimeType: string;
+}
 
 // ---- 配置 ---------------------------------------------------------------
 
@@ -135,7 +140,7 @@ function recognizeWithModel(
 			}
 		};
 
-		const args = ["-p", "--no-extensions", "--model", model];
+		const args = ["-p", "--no-session", "--no-extensions", "--model", model];
 
 		// 视觉代理正文作为子代理的 system prompt
 		let tmpPromptPath: string | null = null;
@@ -245,6 +250,17 @@ export default function (pi: ExtensionAPI) {
 	// 命令指定 > 环境变量 > agent 文件（无默认）
 	let cliModel: string | undefined;
 
+	// 去重缓存：compact 重试时 before_agent_start 会带同一批图片再次触发，
+	// 避免短时间内对同一图片重复调用视觉子代理（一次调用 30s+）
+	const RECOGNITION_CACHE_MS = 60_000;
+	let lastRecognition: { key: string; at: number; result: string } | null = null;
+
+	function imageFingerprint(images: ImageContentLike[]): string {
+		const totalLen = images.reduce((s, i) => s + (i.data?.length ?? 0), 0);
+		const first = images[0]?.data?.slice(0, 64) ?? "";
+		return `${totalLen}:${first}`;
+	}
+
 	function resolveVisionModel(): {
 		model: string;
 		systemPrompt?: string;
@@ -281,6 +297,27 @@ export default function (pi: ExtensionAPI) {
 
 		const currentModel = model ? `${model.provider}/${model.id}` : "unknown";
 
+		// 去重：同一批图片在 60s 内已识别过，直接用缓存结果（compact 重试场景）
+		const fingerprint = imageFingerprint(images);
+		if (
+			lastRecognition &&
+			lastRecognition.key === fingerprint &&
+			Date.now() - lastRecognition.at < RECOGNITION_CACHE_MS
+		) {
+			return {
+				message: {
+					customType: "vision-bridge",
+					content: [
+						`[vision-bridge] 用户附带了图片，但当前模型 (${currentModel}) 不支持图片输入。`,
+						`以下内容由视觉子代理 (${config.model}) 识别图片后生成，请直接使用：`,
+						"",
+						lastRecognition.result,
+					].join("\n"),
+					display: true,
+				},
+			};
+		}
+
 		if (ctx.hasUI) {
 			ctx.ui.notify(
 				`🖼 当前模型 ${currentModel} 不支持图片，调用视觉子代理 (${config.model}) 识别...`,
@@ -292,7 +329,7 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
-		// 图片先保存为临时文件，供子代理用 read 工具读取
+		// 图片先保存为临时文件（0600，仅当前用户可读），供子代理用 read 工具读取
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-bridge-"));
 		const imagePaths: string[] = [];
 		try {
@@ -300,11 +337,24 @@ export default function (pi: ExtensionAPI) {
 				const img = images[i]!;
 				const ext = img.mimeType?.includes("png") ? ".png" : ".jpg";
 				const p = path.join(tmpDir, `image-${i}${ext}`);
-				fs.writeFileSync(p, Buffer.from(img.data, "base64"));
+				fs.writeFileSync(p, Buffer.from(img.data, "base64"), { mode: 0o600 });
 				imagePaths.push(p);
 			}
 		} catch {
 			/* 写文件失败则放弃 */
+		}
+
+		if (imagePaths.length === 0) {
+			try {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			} catch {
+				/* ignore */
+			}
+			if (ctx.hasUI) {
+				ctx.ui.setStatus("vision-bridge", undefined);
+				ctx.ui.notify("⚠️ 图片保存为临时文件失败，视觉子代理无法读取。", "error");
+			}
+			return;
 		}
 
 		const description = await recognizeWithModel(
@@ -315,6 +365,14 @@ export default function (pi: ExtensionAPI) {
 			ctx.signal,
 			MODEL_TIMEOUT_MS,
 		);
+
+		if (description) {
+			lastRecognition = {
+				key: imageFingerprint(images),
+				at: Date.now(),
+				result: description,
+			};
+		}
 
 		try {
 			fs.rmSync(tmpDir, { recursive: true, force: true });

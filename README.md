@@ -93,6 +93,12 @@ mkdir -p ~/.pi/agent/agents
 # 编辑 ~/.pi/agent/agents/vision.md 的 model 字段
 ```
 
+## 行为细节
+
+- **去重缓存**：pi 在 compact 后自动重试 turn 时 `before_agent_start` 会带同一批图片再次触发。扩展对 60 秒内相同图片直接复用上一次的识别结果，避免重复调用视觉模型。
+- **临时文件**：图片保存到系统临时目录（权限 0600，仅当前用户可读），识别完成后自动删除。
+- **子代理会话**：子代理用 `--no-session` 启动，不会留下会话文件。
+
 ## 已知问题
 
 - 视觉模型必须真实支持图片输入（`pi --list-models` 中 `images` 列为 `yes`），否则调用会失败。
