@@ -1,67 +1,31 @@
 /**
  * Vision Bridge
  *
- * 当用户附加图片、但当前模型没有视觉能力时，把图片交给一个
- * **视觉子代理**（独立 pi 子进程 + 指定视觉模型）识别，并把识别结果
- * 注入当前会话，让主模型能基于图片内容继续回答。
+ * 当用户附加图片、但当前模型没有视觉能力时，直接通过 Pi 的
+ * modelRegistry 调用用户配置的视觉模型，并把识别结果注入当前会话。
  *
  * 视觉模型没有内置默认值——完全由配置指定（按优先级）：
- *   1. 命令指定：/vision-bridge model <provider/model-id>（本会话临时）
- *   2. 环境变量：PI_VISION_MODEL="provider/model-id"
- *   3. 子代理定义：~/.pi/agent/agents/vision.md 的 frontmatter `model:` 字段
- *      （推荐：跨会话持久，与 pi-subagents 生态一致，正文可定义代理角色）
+ *   1. /vision-bridge model <provider/model-id>（本会话临时）
+ *   2. PI_VISION_MODEL 环境变量
+ *   3. ~/.pi/agent/agents/vision.md frontmatter 的 model 字段
  *
- * 如果三者都未配置：不调用任何东西，并提示先指定视觉模型。
- * 不同设备安装后，各自配置本机可用的视觉模型即可。
- *
- * 子代理调用：spawn `pi -p --no-extensions --model <视觉模型>` 子进程。
- * 图片先保存为临时文件，任务里让子代理用 read 工具自己读图
- * （pi 对支持图片的模型，read 工具会把图片数据直接交给模型）。
- *
- * 注意：用纯 -p（print）模式而非 rpc/json 事件流模式——部分 provider
- * （如 openai-codex）在 rpc/json 模式下工具调用链路会挂起，纯 -p 正常。
+ * 该实现不启动 pi 子进程、不依赖 read 工具，也不走 rpc/json 子代理协议；
+ * 图片以 base64 ImageContent 直接交给视觉 provider。
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
-// before_agent_start 事件里 event.images 的元素形状（pi 的 ImageContent）
 interface ImageContentLike {
-	type: string;
-	data: string; // base64
+	type: "image";
+	data: string;
 	mimeType: string;
 }
-
-// ---- 配置 ---------------------------------------------------------------
-
-const MODEL_TIMEOUT_MS = 90_000;
-const AGENT_FILE = path.join(
-	os.homedir(),
-	".pi",
-	"agent",
-	"agents",
-	"vision.md",
-);
-
-const VISION_TASK_TEMPLATE = (imagePaths: string[], userPrompt: string) =>
-	[
-		"你是一个图像识别代理。用户刚刚给主对话附加了图片，但主模型不支持图片输入。",
-		"图片已保存为本地文件，请先用 read 工具读取以下图片文件，再回答问题：",
-		...imagePaths.map((p) => `  - ${p}`),
-		"",
-		"读取图片后完成两件事：",
-		"1) 详细、准确地描述图片内容（布局、元素、文字、颜色等）；",
-		"2) 如果用户的问题与图片相关，直接基于图片回答用户的问题。",
-		"",
-		`用户的问题/上下文：${userPrompt || "(无，仅要求描述图片)"}`,
-		"",
-		"只输出最终内容，不要提及你看不到图片（你确实看到了）。",
-	].join("\n");
-
-// ---- 视觉代理配置解析 ----------------------------------------------------
 
 interface VisionAgentConfig {
 	model: string;
@@ -70,30 +34,104 @@ interface VisionAgentConfig {
 	systemPrompt?: string;
 }
 
-/** 解析 ~/.pi/agent/agents/vision.md：frontmatter 的 model/name/description + 正文 */
+type RecognitionResult =
+	| { ok: true; text: string }
+	| { ok: false; error: string };
+
+const DEFAULT_TIMEOUT_MS = 90_000;
+const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const RECOGNITION_CACHE_MS = 60_000;
+const IMAGE_PATH_RE = /[^\s"'`]+\.(?:png|jpe?g|gif|webp|bmp)/gi;
+const AGENT_FILE = path.join(os.homedir(), ".pi", "agent", "agents", "vision.md");
+
+const DEFAULT_SYSTEM_PROMPT = [
+	"你是专业的图像识别代理。",
+	"请直接查看消息中附带的图片，详细、准确地描述图片内容，并回答用户与图片相关的问题。",
+	"关注布局、元素、文字、颜色、界面状态和重要细节。",
+	"不要声称无法查看图片，也不要讨论文件路径或实现方式。",
+].join("\n");
+
+/** 从文本中提取存在的本地图片路径（macOS 剪贴板图片会以这种形式进入无视觉模型）。 */
+function extractImagePaths(text: string): string[] {
+	if (!text) return [];
+	const matches = text.match(IMAGE_PATH_RE) ?? [];
+	const seen = new Set<string>();
+	const paths: string[] = [];
+	for (const raw of matches) {
+		const filePath = raw.trim();
+		if (seen.has(filePath)) continue;
+		seen.add(filePath);
+		try {
+			const stat = fs.statSync(filePath);
+			if (!stat.isFile() || stat.size > MAX_IMAGE_BYTES) continue;
+			paths.push(filePath);
+		} catch {
+			// 路径不存在时忽略。
+		}
+	}
+	return paths;
+}
+
+function mimeTypeForPath(filePath: string): string {
+	switch (path.extname(filePath).toLowerCase()) {
+		case ".png":
+			return "image/png";
+		case ".gif":
+			return "image/gif";
+		case ".webp":
+			return "image/webp";
+		case ".bmp":
+			return "image/bmp";
+		default:
+			return "image/jpeg";
+	}
+}
+
+/** 把消息里的本地图片路径转换为 provider 可直接接收的 ImageContent。 */
+function loadPathImages(imagePaths: string[]): ImageContentLike[] {
+	const images: ImageContentLike[] = [];
+	for (const filePath of imagePaths) {
+		try {
+			const data = fs.readFileSync(filePath);
+			if (data.byteLength > MAX_IMAGE_BYTES) continue;
+			images.push({
+				type: "image",
+				data: data.toString("base64"),
+				mimeType: mimeTypeForPath(filePath),
+			});
+		} catch {
+			// 文件可能已被剪贴板清理，忽略该图片。
+		}
+	}
+	return images;
+}
+
+/** 解析 ~/.pi/agent/agents/vision.md 的 frontmatter 与正文。 */
 function loadVisionAgent(): VisionAgentConfig | null {
 	try {
 		if (!fs.existsSync(AGENT_FILE)) return null;
-		const src = fs.readFileSync(AGENT_FILE, "utf-8");
-		const m = src.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-		if (!m) return null;
-		const frontmatter = m[1] ?? "";
-		const body = (m[2] ?? "").trim();
+		const source = fs.readFileSync(AGENT_FILE, "utf-8");
+		const match = source.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+		if (!match) return null;
+		const frontmatter = match[1] ?? "";
+		const body = (match[2] ?? "").trim();
 		const get = (key: string): string | undefined => {
 			const line = frontmatter
 				.split("\n")
-				.map((l) => l.trim())
-				.find((l) => l.startsWith(`${key}:`) || l.startsWith(`${key} :`));
+				.map((value) => value.trim())
+				.find(
+					(value) =>
+						value.startsWith(`${key}:`) || value.startsWith(`${key} :`),
+				);
 			if (!line) return undefined;
-			const v = line.slice(line.indexOf(":") + 1).trim();
-			return v ? v.replace(/^["']|["']$/g, "") : undefined;
+			const value = line.slice(line.indexOf(":") + 1).trim();
+			return value ? value.replace(/^["']|["']$/g, "") : undefined;
 		};
 		const model = get("model");
-		const name = get("name");
 		if (!model) return null;
 		return {
 			model,
-			name: name || "vision",
+			name: get("name") || "vision",
 			description: get("description"),
 			systemPrompt: body || undefined,
 		};
@@ -102,163 +140,130 @@ function loadVisionAgent(): VisionAgentConfig | null {
 	}
 }
 
-// ---- 工具函数 -----------------------------------------------------------
-
-/** 复用当前 pi 的启动方式（参考官方 subagent 示例） */
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-	return { command: "pi", args };
+function splitModelId(modelSpec: string): { provider: string; id: string } | null {
+	const separator = modelSpec.indexOf("/");
+	if (separator <= 0 || separator === modelSpec.length - 1) return null;
+	return {
+		provider: modelSpec.slice(0, separator),
+		id: modelSpec.slice(separator + 1),
+	};
 }
 
 /**
- * 用视觉模型子进程识别图片，返回最终文本；失败/超时返回 null。
- * 纯 -p（print）模式：图片由子代理用 read 工具自行读取。
+ * 使用 Pi 当前进程中的 modelRegistry 直接调用视觉模型。
+ * modelRegistry 会复用当前设备已有的 provider、OAuth/API key 和代理配置。
  */
-function recognizeWithModel(
-	imagePaths: string[],
+async function recognizeWithModel(
+	registry: ExtensionContext["modelRegistry"],
+	images: ImageContentLike[],
 	userPrompt: string,
-	model: string,
+	modelSpec: string,
 	systemPrompt: string | undefined,
-	signal: AbortSignal | undefined,
+	parentSignal: AbortSignal | undefined,
 	timeoutMs: number,
-): Promise<string | null> {
-	return new Promise<string | null>((resolve) => {
-		let settled = false;
-		const finish = (value: string | null) => {
-			if (!settled) {
-				settled = true;
-				resolve(value);
-			}
-		};
+): Promise<RecognitionResult> {
+	const parsed = splitModelId(modelSpec);
+	if (!parsed) {
+		return { ok: false, error: `模型格式无效：${modelSpec}` };
+	}
 
-		const args = ["-p", "--no-session", "--no-extensions", "--model", model];
+	const model = registry.find(parsed.provider, parsed.id);
+	if (!model) {
+		return { ok: false, error: `当前 Pi 找不到模型：${modelSpec}` };
+	}
+	if (!model.input?.includes("image")) {
+		return { ok: false, error: `配置的模型不支持图片输入：${modelSpec}` };
+	}
+	if (images.length === 0) {
+		return { ok: false, error: "没有可读取的图片数据" };
+	}
 
-		// 视觉代理正文作为子代理的 system prompt
-		let tmpPromptPath: string | null = null;
-		if (systemPrompt) {
-			try {
-				tmpPromptPath = path.join(
-					os.tmpdir(),
-					`vision-agent-${process.pid}-${Date.now()}.md`,
-				);
-				fs.writeFileSync(tmpPromptPath, systemPrompt, { encoding: "utf-8" });
-				args.push("--append-system-prompt", tmpPromptPath);
-			} catch {
-				tmpPromptPath = null;
-			}
-		}
-
-		// -p 模式：prompt 作为最后一个命令行参数
-		args.push(VISION_TASK_TEMPLATE(imagePaths, userPrompt));
-
-		const { command, args: fullArgs } = getPiInvocation(args);
-		let proc: ReturnType<typeof spawn>;
-		try {
-			proc = spawn(command, fullArgs, { stdio: ["ignore", "pipe", "pipe"] });
-		} catch {
-			if (tmpPromptPath) {
-				try {
-					fs.unlinkSync(tmpPromptPath);
-				} catch {
-					/* ignore */
-				}
-			}
-			finish(null);
-			return;
-		}
-
-		let stdout = "";
-		proc.stdout!.on("data", (d: Buffer) => {
-			stdout += d.toString();
-		});
-		proc.stderr!.on("data", () => {
-			/* 忽略 */
-		});
-
-		const cleanupTmp = () => {
-			if (tmpPromptPath) {
-				try {
-					fs.unlinkSync(tmpPromptPath);
-				} catch {
-					/* ignore */
-				}
-			}
-		};
-
-		const killProc = () => {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* ignore */
-			}
-			setTimeout(() => {
-				try {
-					if (!proc.killed) proc.kill("SIGKILL");
-				} catch {
-					/* ignore */
-				}
-			}, 3000);
-		};
-
-		const timeout = setTimeout(() => {
-			killProc();
-			cleanupTmp();
-			finish(null);
-		}, timeoutMs);
-
-		const onAbort = () => {
-			killProc();
-			cleanupTmp();
-			finish(null);
-		};
-
-		proc.on("error", () => {
-			clearTimeout(timeout);
-			if (signal) signal.removeEventListener("abort", onAbort);
-			cleanupTmp();
-			finish(null);
-		});
-
-		proc.on("close", (code) => {
-			clearTimeout(timeout);
-			if (signal) signal.removeEventListener("abort", onAbort);
-			cleanupTmp();
-			const text = stdout.trim();
-			finish(code === 0 && text ? text : null);
-		});
-
-		if (signal) {
-			if (signal.aborted) onAbort();
-			else signal.addEventListener("abort", onAbort, { once: true });
-		}
+	const controller = new AbortController();
+	let resolveCancelled: (result: RecognitionResult) => void = () => {};
+	const cancelled = new Promise<RecognitionResult>((resolve) => {
+		resolveCancelled = resolve;
 	});
-}
+	const onParentAbort = () => {
+		controller.abort();
+		resolveCancelled({ ok: false, error: "视觉识别已取消" });
+	};
+	if (parentSignal) {
+		if (parentSignal.aborted) return { ok: false, error: "视觉识别已取消" };
+		parentSignal.addEventListener("abort", onParentAbort, { once: true });
+	}
+	const timeout = setTimeout(() => {
+		controller.abort();
+		resolveCancelled({
+			ok: false,
+			error: `视觉模型调用超时（${Math.round(timeoutMs / 1000)}s）`,
+		});
+	}, timeoutMs);
 
-// ---- 扩展主体 -----------------------------------------------------------
+	const prompt = userPrompt.trim()
+		? `请查看附带的图片并回答用户的问题：\n${userPrompt}`
+		: "请详细、准确地描述附带的图片。";
+
+	const call = registry
+		.complete(
+			model,
+			{
+				systemPrompt: systemPrompt || DEFAULT_SYSTEM_PROMPT,
+				messages: [
+					{
+						role: "user",
+						content: [{ type: "text", text: prompt }, ...images],
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{
+				signal: controller.signal,
+				timeoutMs,
+			},
+		)
+		.then<RecognitionResult>((message) => {
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				return {
+					ok: false,
+					error: message.errorMessage || `视觉模型返回 ${message.stopReason}`,
+				};
+			}
+			const text = message.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("")
+				.trim();
+			return text
+				? { ok: true, text }
+				: { ok: false, error: "视觉模型未返回文本" };
+		})
+		.catch<RecognitionResult>((error: unknown) => ({
+			ok: false,
+			error: error instanceof Error ? error.message : String(error),
+		}));
+
+	try {
+		return await Promise.race([call, cancelled]);
+	} finally {
+		clearTimeout(timeout);
+		if (parentSignal) {
+			parentSignal.removeEventListener("abort", onParentAbort);
+		}
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	let enabled = true;
-	// 命令指定 > 环境变量 > agent 文件（无默认）
 	let cliModel: string | undefined;
-
-	// 去重缓存：compact 重试时 before_agent_start 会带同一批图片再次触发，
-	// 避免短时间内对同一图片重复调用视觉子代理（一次调用 30s+）
-	const RECOGNITION_CACHE_MS = 60_000;
 	let lastRecognition: { key: string; at: number; result: string } | null = null;
 
 	function imageFingerprint(images: ImageContentLike[]): string {
-		const totalLen = images.reduce((s, i) => s + (i.data?.length ?? 0), 0);
+		const totalLength = images.reduce(
+			(sum, image) => sum + (image.data?.length ?? 0),
+			0,
+		);
 		const first = images[0]?.data?.slice(0, 64) ?? "";
-		return `${totalLen}:${first}`;
+		return `${totalLength}:${first}`;
 	}
 
 	function resolveVisionModel(): {
@@ -274,42 +279,55 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		const images = event.images;
-		if (!enabled || !images || images.length === 0) return;
+		const attachedImages = (event.images ?? []) as ImageContentLike[];
+		const pathImages =
+			attachedImages.length > 0 ? [] : extractImagePaths(event.prompt ?? "");
+		if (!enabled || (attachedImages.length === 0 && pathImages.length === 0)) {
+			return;
+		}
 
-		const model = ctx.model;
-		const hasVision = model?.input?.includes("image");
-		if (hasVision) return; // 当前模型本身能看图，无需桥接
+		const currentModel = ctx.model;
+		if (currentModel?.input?.includes("image")) return;
 
 		const config = resolveVisionModel();
 		if (!config) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(
-					"🖼 图片已收到，但未配置视觉模型。请先指定：\n" +
-						"  · /vision-bridge model <provider/model-id>\n" +
-						"  · 或编辑 ~/.pi/agent/agents/vision.md 的 model 字段\n" +
-						"  · 或设置环境变量 PI_VISION_MODEL",
+					"🖼 图片已收到，但未配置视觉模型。请使用 /vision-bridge model <provider/model-id>，或配置 ~/.pi/agent/agents/vision.md。",
 					"warning",
 				);
 			}
-			return; // 未配置：不调用任何东西
+			return;
 		}
 
-		const currentModel = model ? `${model.provider}/${model.id}` : "unknown";
+		const images =
+			attachedImages.length > 0 ? attachedImages : loadPathImages(pathImages);
+		if (images.length === 0) {
+			if (ctx.hasUI) {
+				ctx.ui.notify("⚠️ 无法读取图片数据，视觉识别未启动。", "error");
+			}
+			return;
+		}
 
-		// 去重：同一批图片在 60s 内已识别过，直接用缓存结果（compact 重试场景）
-		const fingerprint = imageFingerprint(images);
+		const currentModelId = currentModel
+			? `${currentModel.provider}/${currentModel.id}`
+			: "unknown";
+		const cacheKey = [
+			config.model,
+			event.prompt ?? "",
+			imageFingerprint(images),
+		].join("\u0000");
+
 		if (
-			lastRecognition &&
-			lastRecognition.key === fingerprint &&
+			lastRecognition?.key === cacheKey &&
 			Date.now() - lastRecognition.at < RECOGNITION_CACHE_MS
 		) {
 			return {
 				message: {
 					customType: "vision-bridge",
 					content: [
-						`[vision-bridge] 用户附带了图片，但当前模型 (${currentModel}) 不支持图片输入。`,
-						`以下内容由视觉子代理 (${config.model}) 识别图片后生成，请直接使用：`,
+						`[vision-bridge] 当前模型 (${currentModelId}) 不支持图片输入。`,
+						`以下内容由视觉模型 (${config.model}) 识别，请直接基于它回答：`,
 						"",
 						lastRecognition.result,
 					].join("\n"),
@@ -320,88 +338,51 @@ export default function (pi: ExtensionAPI) {
 
 		if (ctx.hasUI) {
 			ctx.ui.notify(
-				`🖼 当前模型 ${currentModel} 不支持图片，调用视觉子代理 (${config.model}) 识别...`,
+				`🖼 调用视觉模型 (${config.model}) 直接识别图片...`,
 				"info",
 			);
 			ctx.ui.setStatus(
 				"vision-bridge",
-				`👁 视觉子代理 ${config.model} 识别中...`,
+				`👁 视觉模型 ${config.model} 识别中...`,
 			);
 		}
 
-		// 图片先保存为临时文件（0600，仅当前用户可读），供子代理用 read 工具读取
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vision-bridge-"));
-		const imagePaths: string[] = [];
-		try {
-			for (let i = 0; i < images.length; i++) {
-				const img = images[i]!;
-				const ext = img.mimeType?.includes("png") ? ".png" : ".jpg";
-				const p = path.join(tmpDir, `image-${i}${ext}`);
-				fs.writeFileSync(p, Buffer.from(img.data, "base64"), { mode: 0o600 });
-				imagePaths.push(p);
-			}
-		} catch {
-			/* 写文件失败则放弃 */
-		}
-
-		if (imagePaths.length === 0) {
-			try {
-				fs.rmSync(tmpDir, { recursive: true, force: true });
-			} catch {
-				/* ignore */
-			}
-			if (ctx.hasUI) {
-				ctx.ui.setStatus("vision-bridge", undefined);
-				ctx.ui.notify("⚠️ 图片保存为临时文件失败，视觉子代理无法读取。", "error");
-			}
-			return;
-		}
-
-		const description = await recognizeWithModel(
-			imagePaths,
+		const result = await recognizeWithModel(
+			ctx.modelRegistry,
+			images,
 			event.prompt ?? "",
 			config.model,
 			config.systemPrompt,
 			ctx.signal,
-			MODEL_TIMEOUT_MS,
+			DEFAULT_TIMEOUT_MS,
 		);
 
-		if (description) {
-			lastRecognition = {
-				key: imageFingerprint(images),
-				at: Date.now(),
-				result: description,
-			};
-		}
+		if (ctx.hasUI) ctx.ui.setStatus("vision-bridge", undefined);
 
-		try {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
-		} catch {
-			/* ignore */
-		}
-
-		if (ctx.hasUI) {
-			ctx.ui.setStatus("vision-bridge", undefined);
-		}
-
-		if (!description) {
+		if (!result.ok) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(
-					`⚠️ 视觉子代理 (${config.model}) 识别失败或超时（${MODEL_TIMEOUT_MS / 1000}s）。可换模型重试：/vision-bridge model <id>`,
+					`⚠️ 视觉模型 (${config.model}) 识别失败：${result.error}`,
 					"error",
 				);
 			}
 			return;
 		}
 
+		lastRecognition = {
+			key: cacheKey,
+			at: Date.now(),
+			result: result.text,
+		};
+
 		return {
 			message: {
 				customType: "vision-bridge",
 				content: [
-					`[vision-bridge] 用户附带了图片，但当前模型 (${currentModel}) 不支持图片输入。`,
-					`以下内容由视觉子代理 (${config.model}) 识别图片后生成，请直接使用：`,
+					`[vision-bridge] 当前模型 (${currentModelId}) 不支持图片输入。`,
+					`以下内容由视觉模型 (${config.model}) 识别，请直接基于它回答：`,
 					"",
-					description,
+					result.text,
 				].join("\n"),
 				display: true,
 			},
@@ -410,20 +391,20 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("vision-bridge", {
 		description:
-			"Vision bridge: 用视觉子代理识别图片并注入会话。用法: /vision-bridge [on|off|model <provider/model-id>|status]",
+			"Vision bridge: 用视觉模型识别图片并注入会话。用法: /vision-bridge [on|off|model <provider/model-id>|status]",
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
-			const sub = parts[0]?.toLowerCase();
+			const subcommand = parts[0]?.toLowerCase();
 
-			if (sub === "off") {
+			if (subcommand === "off") {
 				enabled = false;
 				ctx.ui.notify("Vision bridge disabled.", "info");
-			} else if (sub === "on") {
+			} else if (subcommand === "on") {
 				enabled = true;
 				ctx.ui.notify("Vision bridge enabled.", "info");
-			} else if (sub === "model" && parts[1]) {
+			} else if (subcommand === "model" && parts[1]) {
 				cliModel = parts[1];
-				ctx.ui.notify(`视觉模型已指定: ${cliModel}（本会话生效）`, "info");
+				ctx.ui.notify(`视觉模型已指定：${cliModel}（本会话生效）`, "info");
 			} else {
 				const envModel = process.env.PI_VISION_MODEL?.trim();
 				const agent = loadVisionAgent();
@@ -431,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 					`Vision bridge: ${enabled ? "ON" : "OFF"}\n` +
 						`当前生效模型: ${cliModel ?? envModel ?? agent?.model ?? "未配置"}\n` +
 						`来源: ${cliModel ? "命令指定" : envModel ? "环境变量 PI_VISION_MODEL" : agent ? `agent 文件 ${AGENT_FILE}` : "无"}\n` +
-						`配置方法: /vision-bridge model <provider/model-id>，或编辑 ${AGENT_FILE}`,
+						`调用方式: 进程内直连 provider（不启动子进程）`,
 					"info",
 				);
 			}

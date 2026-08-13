@@ -1,7 +1,7 @@
 {
   "name": "pi-vision-bridge",
-  "version": "2.0.0",
-  "description": "Give non-vision Pi models image understanding: auto-delegates attached images to a configured vision-capable sub-agent (no built-in default model).",
+  "version": "2.1.0",
+  "description": "Give non-vision Pi models image understanding through a configured vision model using Pi's in-process provider runtime.",
   "type": "module",
   "license": "MIT",
   "author": "zhonghui5207",
