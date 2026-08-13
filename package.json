@@ -1,7 +1,7 @@
 {
   "name": "pi-vision-bridge",
-  "version": "1.0.0",
-  "description": "Give non-vision Pi models image understanding: auto-delegates attached images to a vision-capable model sub-agent, with a macOS local OCR fallback.",
+  "version": "2.0.0",
+  "description": "Give non-vision Pi models image understanding: auto-delegates attached images to a configured vision-capable sub-agent (no built-in default model).",
   "type": "module",
   "license": "MIT",
   "author": "zhonghui5207",
@@ -16,8 +16,8 @@
     "pi-extension",
     "vision",
     "image",
-    "ocr",
-    "multimodal"
+    "multimodal",
+    "subagent"
   ],
   "pi": {
     "extensions": [
@@ -28,5 +28,13 @@
     "extensions",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
 }

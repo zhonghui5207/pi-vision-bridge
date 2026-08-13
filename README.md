@@ -2,11 +2,9 @@
 
 让**没有视觉能力**的 Pi 模型（如 `deepseek-v4-flash`）也能"看懂"用户附加的图片。
 
-当用户附带图片、但当前模型不支持图片输入时，本扩展会自动：
+当用户附带图片、但当前模型不支持图片输入时，本扩展会自动把图片交给一个**视觉子代理**（独立 pi 子进程 + 你指定的视觉模型）识别，再把识别结果注入当前会话——主模型就能基于图片内容正常回答。
 
-1. 把图片交给**有视觉能力的模型子进程**（`pi --mode rpc` 子代理）识别；
-2. 全部视觉模型失败时，回退到 **macOS 本地 OCR**（Vision 框架，离线可用，中英文）；
-3. 把识别结果作为一条 `[vision-bridge]` 消息注入当前会话，主模型就能基于图片内容正常回答。
+**视觉模型没有内置默认值，完全由你在每台设备上自行配置**（不同设备可用的模型不同，扩展不做假设）。
 
 ## 安装
 
@@ -20,58 +18,86 @@ pi install git:github.com/zhonghui5207/pi-vision-bridge
 pi -e git:github.com/zhonghui5207/pi-vision-bridge
 ```
 
-安装后 `/reload`（或重启 pi）生效。扩展放在 `~/.pi/agent/extensions/` 自动发现。
+安装后 `/reload`（或重启 pi）生效。
+
+## 配置视觉模型（必须，三选一）
+
+### 方式一（推荐）：子代理定义文件 `~/.pi/agent/agents/vision.md`
+
+创建该文件，`model:` 字段填你本机可用的视觉模型（`provider/model-id` 格式，可用 `pi --list-models | grep -i images` 查询本机哪些模型支持图片）：
+
+```markdown
+---
+name: vision
+description: 图像识别子代理：查看图片并描述内容/回答与图片相关的问题。
+model: kimi-coding/k3
+tools: none
+no-session: true
+---
+
+你是专业的图像识别代理。查看用户附加的图片，然后：
+1) 详细准确地描述图片内容（布局、元素、文字、颜色、风格等）；
+2) 如果用户的问题与图片相关，直接基于图片回答。
+```
+
+改 `model:` 一行即可切换视觉模型。正文定义了子代理的角色。
+
+### 方式二：环境变量
+
+```bash
+export PI_VISION_MODEL="openai-codex/gpt-5.4-mini"
+```
+
+### 方式三：命令指定（本会话临时）
+
+```
+/vision-bridge model <provider/model-id>
+```
+
+优先级：命令指定 > 环境变量 > agent 文件。三者都未配置时，扩展不会调用任何东西，只会提示你配置。
 
 ## 使用
 
-什么都不用配。给不支持视觉的模型发一张图片，扩展会自动接管：
+什么都不用配（除了上面选一种方式指定视觉模型）。给不支持视觉的模型发图片，扩展自动接管：
 
-```
-🖼 当前模型 deepseek/deepseek-v4-flash 不支持图片，自动交给视觉代理识别...
-```
-
-识别结果会作为 `[vision-bridge]` 消息进入 LLM 上下文，主模型基于它继续回答。
+- 触发时提示：`🖼 当前模型 ... 不支持图片，调用视觉子代理 (kimi-coding/k3) 识别...`
+- 底部状态栏显示：`👁 视觉子代理 kimi-coding/k3 识别中...`
+- 识别结果作为 `[vision-bridge]` 消息注入 LLM 上下文，主模型基于它回答
 
 ### 命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `/vision-bridge` | 查看状态（开关、模型链、OCR 兜底） |
+| `/vision-bridge` | 查看状态（开关、当前生效模型及来源） |
 | `/vision-bridge on` / `off` | 启用 / 禁用 |
-| `/vision-bridge model <provider/model>` | 只用指定模型 |
-| `/vision-bridge models <a,b,c>` | 设置模型链（逗号分隔） |
-| `/vision-bridge ocr on` / `off` | 启用 / 禁用 OCR 兜底 |
-
-### 环境变量
-
-- `PI_VISION_MODELS="newlink/claude-sonnet-4-6,kimi-coding/k3"` — 覆盖默认模型链
-
-## 识别策略（依次回退）
-
-1. **视觉模型链**（默认）：`newlink/claude-sonnet-4-6` → `kimi-coding/k3` → `kimi-coding/k3-256k`。每个模型超时 60s，失败即切下一个。
-2. **macOS 本地 OCR**：预编译的 arm64 二进制（`extensions/vision-bridge-ocr.bin`），提取图片中的中英文文字。适合截图、文档等文字为主的图片。
-
-如果当前模型本身支持视觉（`input` 包含 `image`），扩展会直接跳过，不做任何额外调用。
+| `/vision-bridge model <provider/model-id>` | 本会话指定视觉模型 |
 
 ## 工作原理
 
-- 监听 `before_agent_start` 事件，读取 `event.images`（base64 `ImageContent[]`）；
-- 检查 `ctx.model.input` 是否包含 `"image"` 判断当前模型是否有视觉；
-- 无视觉时 spawn `pi --mode rpc --no-extensions --model <视觉模型>` 子进程，通过 RPC 协议把图片（base64）直接发给视觉模型（这正是 Pi 官方 `pi-subagents` 的同款"子代理"模式：独立进程 + 独立上下文 + `--model` 覆盖）；
-- RPC 子进程的 **stdin 必须保持打开**直到拿到最终 `message_end`，否则 Pi 会把 stdin 关闭当作 shutdown 信号提前退出；
+- 监听 `before_agent_start`，读取 `event.images`（base64 `ImageContent[]`）；
+- 检查 `ctx.model.input` 是否包含 `"image"` 判断当前模型是否有视觉，有则直接跳过；
+- 无视觉时 spawn `pi --mode rpc --no-extensions --model <你的视觉模型>` 子进程（与 pi-subagents 同款的"子代理"模式：独立进程 + 独立上下文 + `--model` 覆盖），通过 RPC 协议把图片（base64）发给视觉模型；
+- 子代理正文（vision.md 的内容）通过 `--append-system-prompt` 注入子进程；
+- **关键**：RPC 子进程的 stdin 必须保持打开直到拿到最终 `message_end`，否则 pi 会把 stdin 关闭当作 shutdown 信号提前退出；
 - 把子代理输出作为 `{ message: { customType: "vision-bridge", ... } }` 注入会话（进入 LLM 上下文）。
 
-## 已知问题与注意事项
+## 多设备说明
 
-- **macOS 专用**：OCR 兜底依赖 macOS Vision 框架；预编译的 `vision-bridge-ocr.bin` 是 **arm64** 架构。如需重新编译（如换机器/系统更新后）：
+每台设备安装后，各自配置本机可用的视觉模型：
 
-  ```bash
-  swiftc -O extensions/vision-bridge-ocr.swift -o extensions/vision-bridge-ocr.bin
-  ```
+```bash
+# 查本机哪些模型支持图片
+pi --list-models | grep -i images
+# 写入本机配置
+mkdir -p ~/.pi/agent/agents
+# 编辑 ~/.pi/agent/agents/vision.md 的 model 字段
+```
 
-- **Rosetta 环境**：如果 pi 在 Rosetta（x86_64 翻译）下运行，`swift`/`xcrun` 子进程会因 CommandLineTools 缺少 x86_64 切片而失败——因此扩展优先使用预编译的 arm64 二进制（原生 Mach-O 不受影响），并保留 `arch -arm64 swift` 与 `swift` 两级回退。
-- **RPC 模式下的 UI 限制**：主会话在 RPC 模式时 `setWorkingMessage`/`setWorkingIndicator` 是 no-op，但 `before_agent_start` 事件与消息注入**可用**——所以本扩展在 Telegram Bridge 等 RPC 场景下同样有效。
-- 视觉模型链需要对应 provider 已配置且可用（如 `newlink` 网关需要飞连/VPN 可达）。
+## 已知问题
+
+- 视觉模型必须真实支持图片输入（`pi --list-models` 中 `images` 列为 `yes`），否则调用会失败。
+- 某些供应商的视觉接口不稳定（超时/卡死），扩展默认 90s 超时并清理子进程；可换其他视觉模型重试。
+- 主会话在 RPC 模式时部分 UI API 是 no-op，但 `before_agent_start` 事件与消息注入可用——本扩展在 Telegram Bridge 等 RPC 场景同样有效。
 
 ## License
 
